@@ -15,6 +15,8 @@
 
 #include <cuda_runtime_api.h>
 
+#define UNUSED(x) (void)(x)
+
 #define NO_FLAGS              0
 #define NO_OFFSET             0
 #define NO_CALLBACK           NULL
@@ -87,6 +89,7 @@ ncclResult_t ncclSisciDevices(int* ndev) {
 
 // Return the device path in /sys. NCCL will call free on this path.
 ncclResult_t ncclSisciPciPath(int dev, char** path) {
+    UNUSED(dev);
     char devicepath[PATH_MAX];
     strcpy(devicepath, "/sys/class/pci_bus/0000:da/device/0000:da:00.0/");
     *path = realpath(devicepath, NULL);
@@ -98,6 +101,7 @@ ncclResult_t ncclSisciPciPath(int dev, char** path) {
 // as data from the current GPU. Supported types should be composed with
 // NCCL_PTR_HOST and NCCL_PTR_CUDA.
 ncclResult_t ncclSisciPtrSupport(int dev, int* supportedTypes) {
+    UNUSED(dev);
     *supportedTypes = NCCL_PTR_HOST | NCCL_PTR_CUDA;
 
     return ncclSuccess;
@@ -548,6 +552,11 @@ ncclResult_t ncclSisciIrecv(void* recvComm, void* data, int size, void* mhandle,
 // Perform a flush/fence to make sure all data received with NCCL_PTR_CUDA is
 // visible to the GPU
 ncclResult_t ncclSisciFlush(void* recvComm, void* data, int size, void* mhandle) {
+    UNUSED(recvComm);
+    UNUSED(data);
+    UNUSED(size);
+    UNUSED(mhandle);
+
     return ncclInternalError;
 }
 
