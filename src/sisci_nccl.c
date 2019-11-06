@@ -426,7 +426,9 @@ ncclResult_t ncclSisciDeregMr(void* comm, void* mhandle) {
                                            gcomm->dev->adapter_no,
                                            NO_FLAGS));
 
-    NCCLCHECK(ncclSCIRemoveSegment(memhandle->local_segment, NO_FLAGS));
+    while (ncclSCIRemoveSegment(memhandle->local_segment, NO_FLAGS) !=
+           ncclSuccess) {}
+
     NCCLCHECK(ncclSCIClose(memhandle->sd, NO_FLAGS));
 
     free(mhandle);
