@@ -255,6 +255,21 @@ static ncclResult_t ncclSisciCreateMailbox(struct ncclSisciDev *dev,
     return ncclSuccess;
 }
 
+static ncclResult_t ncclSisciRemoveMailbox(struct ncclSisciDev *dev,
+                                           struct ncclSisciMailbox *mailbox) {
+    NCCLCHECK(ncclSCIUnmapSegment(mailbox->remote_map, NO_FLAGS));
+    NCCLCHECK(ncclSCIDisconnectSegment(mailbox->remote_segment, NO_FLAGS));
+
+    NCCLCHECK(ncclSCIUnmapSegment(mailbox->local_map, NO_FLAGS));
+    NCCLCHECK(ncclSCISetSegmentUnavailable(mailbox->local_segment,
+                                           dev->adapter_no,
+                                           NO_FLAGS));
+    NCCLCHECK(ncclSCIRemoveSegment(mailbox->local_segment, NO_FLAGS));
+    NCCLCHECK(ncclSCIClose(mailbox->sd, NO_FLAGS));
+
+    return ncclSuccess;
+}
+
 static ncclResult_t ncclSisciConnectMailbox(struct ncclSisciDev *dev,
                                             struct ncclSisciMailbox *mailbox,
                                             unsigned int segment_id,
@@ -295,7 +310,7 @@ ncclResult_t ncclSisciConnect(int dev, void* opaqueHandle, void** sendComm) {
                                 comm->dev->adapter_no, handle->irno,
                                 INFINITE_TIMEOUT, NO_FLAGS));
     NCCLCHECK(ncclSCITriggerDataInterrupt(ir, &data, sizeof(data), NO_FLAGS));
-    /* TODO: Disconnect interrupt */
+    NCCLCHECK(ncclSCIDisconnectDataInterrupt(ir, NO_FLAGS));
 
     NCCLCHECK(ncclSisciCreateMailbox(comm->dev, &comm->mailbox,
                                      get_mailbox_id(SISCI_SEND,
@@ -401,10 +416,15 @@ ncclResult_t ncclSisciRegMr(void* comm, void* data, int size, int type, void** m
 }
 ncclResult_t ncclSisciDeregMr(void* comm, void* mhandle) {
     struct ncclSisciMemHandle *memhandle = (struct ncclSisciMemHandle*)mhandle;
+    struct ncclSisciComm *gcomm = (struct ncclSisciComm*)comm;
 
     if (memhandle->remote_segment != NULL) {
         NCCLCHECK(ncclSCIDisconnectSegment(memhandle->remote_segment, NO_FLAGS));
     }
+
+    NCCLCHECK(ncclSCISetSegmentUnavailable(memhandle->local_segment,
+                                           gcomm->dev->adapter_no,
+                                           NO_FLAGS));
 
     NCCLCHECK(ncclSCIRemoveSegment(memhandle->local_segment, NO_FLAGS));
     NCCLCHECK(ncclSCIClose(memhandle->sd, NO_FLAGS));
@@ -611,18 +631,41 @@ ncclResult_t ncclSisciTest(void* request, int* done, int* size) {
 
     if (size) *size = req->size;
 
+    if (*done) {
+        free(request);
+    }
+
     return ncclSuccess;
 }
 
 // Close and free send/recv comm objects
 ncclResult_t ncclSisciCloseSend(void* sendComm) {
+    struct ncclSisciSendComm *comm = (struct ncclSisciSendComm*)sendComm;
+
+    NCCLCHECK(ncclSisciRemoveMailbox(comm->dev, comm->mailbox));
+    NCCLCHECK(ncclSCIRemoveDMAQueue(comm->dq, NO_FLAGS));
+    NCCLCHECK(ncclSCIClose(comm->sd, NO_FLAGS));
+
+    free(sendComm);
+
     return ncclSuccess;
 }
 ncclResult_t ncclSisciCloseRecv(void* recvComm) {
+    struct ncclSisciRecvComm *comm = (struct ncclSisciRecvComm*)recvComm;
+
+    NCCLCHECK(ncclSisciRemoveMailbox(comm->dev, comm->mailbox));
+
+    free(recvComm);
+
     return ncclSuccess;
 }
 ncclResult_t ncclSisciCloseListen(void* listenComm) {
-    /* struct ncclSisciListenComm *comm = (struct ncclSisciListenComm*)listenComm; */
+    struct ncclSisciListenComm *comm = (struct ncclSisciListenComm*)listenComm;
+
+    NCCLCHECK(ncclSCIRemoveDataInterrupt(comm->ir, NO_FLAGS));
+    NCCLCHECK(ncclSCIClose(comm->sd, NO_FLAGS));
+
+    free(listenComm);
 
     return ncclSuccess;
 }
