@@ -10,10 +10,12 @@
 #include "sisci_nccl.h"
 
 static ncclResult_t handle_sisci_error(const char *filename, int lineno, const char *function,
-                                       sci_error_t error) {
+                                       sci_error_t error, int quiet) {
   if (error != SCI_ERR_OK) {
-      WARN("%s:%d: %s: %s", filename, lineno, function,
-           SCIGetErrorString(error));
+      if (!quiet) {
+          WARN("%s:%d: %s: %s", filename, lineno, function,
+               SCIGetErrorString(error));
+      }
     return ncclInternalError;
   }
 
@@ -24,14 +26,14 @@ static ncclResult_t handle_sisci_error(const char *filename, int lineno, const c
     ({                      \
     sci_error_t err; \
     fn(__VA_ARGS__, &err); \
-    handle_sisci_error(__FILE__, __LINE__, #fn, err);       \
+    handle_sisci_error(__FILE__, __LINE__, #fn, err, 0);  \
     })
 
 #define SISCI_WRAP_RET(fn, ret, ...)                        \
     ({                                                      \
         sci_error_t err;                                    \
         *(ret) = fn(__VA_ARGS__, &err);                     \
-        handle_sisci_error(__FILE__, __LINE__, #fn, err);   \
+        handle_sisci_error(__FILE__, __LINE__, #fn, err, 1);  \
     })
 
 #define SISCI_WRAP_NOERROR(fn, ret, ...)                        \

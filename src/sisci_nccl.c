@@ -13,6 +13,7 @@
 #include <stdint.h>
 #include <arpa/inet.h>
 
+#include <cuda.h>
 #include <cuda_runtime_api.h>
 
 #define UNUSED(x) (void)(x)
@@ -31,9 +32,9 @@
 #define MEMORY_SEGMENT_PREFIX SEGMENT_PREFIX | 0x0000ba00
 #define REQUEST_BUFFER_SIZE   32
 
-#define COMM_FLAG_EMPTY 0
-#define COMM_FLAG_NOTIFY 1
-#define COMM_FLAG_ACK 2
+#define COMM_FLAG_EMPTY   0
+#define COMM_FLAG_REQUEST 1
+#define COMM_FLAG_NOTIFY  2
 
 struct ncclSisciDev {
     unsigned int available;
@@ -139,6 +140,12 @@ enum ncclSisciCommState {COMM_READY,
                          SEND_WAIT_ACK,
                          RECV_WAITING};
 
+struct ncclSisciChannel {
+    unsigned int id;
+    enum ncclSisciCommState state;
+    struct ncclSisciMailbox *mailbox;
+};
+
 struct ncclSisciComm {
     sci_desc_t sd;
     enum ncclSisciCommType type;
@@ -149,7 +156,7 @@ struct ncclSisciComm {
     struct ncclSisciMailbox *mailbox;
     sci_dma_queue_t dq;
     unsigned int request_cnt;
-    enum ncclSisciCommState state[REQUEST_BUFFER_SIZE];
+    struct ncclSisciChannel channels[REQUEST_BUFFER_SIZE];
 };
 
 #define ncclSisciRecvComm ncclSisciComm
@@ -166,6 +173,8 @@ struct ncclSisciMemHandle {
     volatile void *segment_addr;
     void *addr;
     unsigned int busy;
+    uint64_t offset;
+    int type;
 };
 
 struct ncclSisciRequest {
@@ -177,11 +186,7 @@ struct ncclSisciRequest {
     unsigned int size;
     unsigned int offset;
     struct ncclSisciMemHandle *memhandle;
-    volatile uint32_t *local_flag;
-    volatile uint32_t *remote_flag;
-    volatile uint32_t *local_size;
-    volatile uint32_t *remote_size;
-    enum ncclSisciCommState *state;
+    struct ncclSisciChannel *channel;
 };
 
 static unsigned int memory_segment_id(unsigned int node_offset,
@@ -291,6 +296,45 @@ static ncclResult_t ncclSisciConnectMailbox(struct ncclSisciDev *dev,
     return ncclSuccess;
 }
 
+static void ncclSisciInitChannels(struct ncclSisciChannel *channels,
+                                  struct ncclSisciMailbox *mailbox) {
+    for (unsigned int i = 0; i < REQUEST_BUFFER_SIZE; i++) {
+        struct ncclSisciChannel *channel = channels + i;
+
+        channel->id = i;
+        channel->mailbox = mailbox;
+        channel->state = COMM_READY;
+    }
+}
+
+static void mailbox_write(struct ncclSisciChannel *channel,
+                          uint32_t command,
+                          uint32_t value) {
+    uint32_t *remote_command = (uint32_t*)channel->mailbox->remote_addr + channel->id*2;
+    uint32_t *remote_value = remote_command + 1;
+
+    *remote_value = value;
+    *remote_command = command;
+}
+
+static int mailbox_read(struct ncclSisciChannel *channel,
+                         uint32_t command,
+                         uint32_t *value) {
+    uint32_t *local_command = (uint32_t*)channel->mailbox->local_addr + channel->id*2;
+    uint32_t *local_value = local_command + 1;
+
+    if (*local_command == command) {
+        if (value != NULL) {
+            *value = *local_value;
+        }
+
+        *local_command = COMM_FLAG_EMPTY;
+        return 1;
+    }
+
+    return 0;
+}
+
 // Connect to a handle and return a sending comm object for that peer.
 ncclResult_t ncclSisciConnect(int dev, void* opaqueHandle, void** sendComm) {
     struct ncclSisciSendComm *comm;
@@ -315,6 +359,7 @@ ncclResult_t ncclSisciConnect(int dev, void* opaqueHandle, void** sendComm) {
     NCCLCHECK(ncclSisciCreateMailbox(comm->dev, &comm->mailbox,
                                      get_mailbox_id(SISCI_SEND,
                                                     comm->remote_node_offset)));
+    ncclSisciInitChannels(comm->channels, comm->mailbox);
 
     NCCLCHECK(ncclSCICreateDMAQueue(comm->sd, &comm->dq, comm->dev->adapter_no,
                                       128, NO_FLAGS));
@@ -345,21 +390,37 @@ ncclResult_t ncclSisciAccept(void* listenComm, void** recvComm) {
     NCCLCHECK(ncclSisciCreateMailbox(rcomm->dev, &rcomm->mailbox,
                                      get_mailbox_id(SISCI_RECV,
                                                     rcomm->remote_node_offset)));
+    ncclSisciInitChannels(rcomm->channels, rcomm->mailbox);
+
+
     *recvComm = rcomm;
 
     return ncclSuccess;
 }
 
+void devptr_set_sync_memops(void* dev_ptr)
+{
+    unsigned flag = 1;
+
+    CUresult err = cuPointerSetAttribute(&flag, CU_POINTER_ATTRIBUTE_SYNC_MEMOPS, (CUdeviceptr) dev_ptr);
+
+    if (err != CUDA_SUCCESS)
+    {
+        INFO(NCCL_INIT, "Failed to set pointer attribute CU_POINTER_ATTRIBYTE_SYNC_MEMOPS");
+    }
+}
+
 void* devptr(void* ptr)
 {
     struct cudaPointerAttributes attrs;
+    int gpu = 1;
 
-    cudaError_t err; // = cudaSetDevice(gpu);
-    // if (err != cudaSuccess)
-    // {
-        // log_error("Failed to set GPU: %s", cudaGetErrorString(err));
-    //     return NULL;
-    // }
+    cudaError_t err = cudaSetDevice(gpu);
+    if (err != cudaSuccess)
+    {
+        WARN("Failed to set GPU: %s", cudaGetErrorString(err));
+        return NULL;
+    }
 
     err = cudaPointerGetAttributes(&attrs, ptr);
     if (err != cudaSuccess)
@@ -368,14 +429,22 @@ void* devptr(void* ptr)
         return NULL;
     }
 
-    INFO(NCCL_NET, "CUDA device buffer %p has device ptr %p", ptr, attrs.devicePointer);
-    return attrs.hostPointer;
+    INFO(NCCL_INIT, "CUDA device buffer %p has device ptr %p", ptr, attrs.devicePointer);
+    return attrs.devicePointer;
 }
+
+#define GPU_BOUND_SHIFT   16
+#define GPU_BOUND_SIZE    ((uint64_t)1 << GPU_BOUND_SHIFT)
+#define GPU_BOUND_OFFSET  (GPU_BOUND_SIZE-1)
+#define GPU_BOUND_MASK    (~GPU_BOUND_OFFSET)
 
 // Register/Deregister memory. Comm can be either a sendComm or a recvComm.
 // Type is either NCCL_PTR_HOST or NCCL_PTR_CUDA.
 ncclResult_t ncclSisciRegMr(void* comm, void* data, int size, int type, void** mhandle) {
     struct ncclSisciComm *gcomm = (struct ncclSisciComm*)comm;
+
+    printf("RegMr: ptr=%p, size=0x%x, type=%s\n",
+           data, size, type == NCCL_PTR_HOST ? "host" : "cuda");
 
     struct ncclSisciMemHandle *memhandle;
     NCCLCHECK(ncclCalloc(&memhandle, 1));
@@ -388,21 +457,41 @@ ncclResult_t ncclSisciRegMr(void* comm, void* data, int size, int type, void** m
                                                      memhandle->memory_id);
     // memhandle->addr = devptr(data);
     memhandle->addr = data;
+    memhandle->type = type;
 
     NCCLCHECK(ncclSCIOpen(&memhandle->sd, NO_FLAGS));
 
-    NCCLCHECK(ncclSCICreateSegment(memhandle->sd, &memhandle->local_segment,
-                                     memhandle->segment_id, size,
-                                     NO_CALLBACK, NO_ARG, SCI_FLAG_EMPTY));
-
     if (type == NCCL_PTR_CUDA) {
-        NCCLCHECK(ncclSCIAttachPhysicalMemory((sci_ioaddr_t)memhandle->addr, NULL, 0, size,
-                                                memhandle->local_segment,
-                                                SCI_FLAG_CUDA_BUFFER));
+
+        // memhandle->addr = devptr(data);
+        void *dptr = devptr(memhandle->addr);
+        devptr_set_sync_memops(dptr);
+        uint64_t start = (uint64_t)dptr & GPU_BOUND_MASK;
+        size_t pin_size = (uint64_t)dptr + size - start;
+        memhandle->offset = (uint64_t)dptr - start;
+
+        memhandle->addr = (void*)start;
+
+        printf("CUDA: aligned=%p, pin_size=0x%lx, offset=0x%lx\n",
+               (void*)start, pin_size, memhandle->offset);
+
+        NCCLCHECK(ncclSCICreateSegment(memhandle->sd, &memhandle->local_segment,
+                                       memhandle->segment_id, size,
+                                       NO_CALLBACK, NO_ARG, SCI_FLAG_EMPTY));
+
+        NCCLCHECK(ncclSCIAttachPhysicalMemory(0, (void*)start, 0, size,
+                                              memhandle->local_segment,
+                                              SCI_FLAG_CUDA_BUFFER));
+
     } else {
+        NCCLCHECK(ncclSCICreateSegment(memhandle->sd, &memhandle->local_segment,
+                                       memhandle->segment_id, size,
+                                       NO_CALLBACK, NO_ARG, SCI_FLAG_EMPTY));
+
         NCCLCHECK(ncclSCIRegisterSegmentMemory(memhandle->addr, size,
-                                                 memhandle->local_segment,
-                                                 NO_FLAGS));
+                                               memhandle->local_segment,
+                                               NO_FLAGS));
+        memhandle->offset = 0;
     }
 
     NCCLCHECK(ncclSCIPrepareSegment(memhandle->local_segment, gcomm->dev->adapter_no,
@@ -457,16 +546,29 @@ ncclResult_t ncclSisciIsend(void* sendComm, void* data, int size, void* mhandle,
     struct ncclSisciSendComm *comm = (struct ncclSisciSendComm*)sendComm;
     struct ncclSisciMemHandle *memhandle = (struct ncclSisciMemHandle*)mhandle;
     struct ncclSisciRequest *req;
-    size_t offset = (uint8_t*)data - (uint8_t*)memhandle->addr;
-    enum ncclSisciCommState state = comm->state[comm->request_cnt % REQUEST_BUFFER_SIZE];
+    size_t local_offset = (uint8_t*)data - (uint8_t*)memhandle->addr;
+    struct ncclSisciChannel *channel = &comm->channels[comm->request_cnt % REQUEST_BUFFER_SIZE];
+
+    if (comm->mailbox->remote_addr == NULL) {
+        NCCLCHECK(ncclSisciConnectMailbox(comm->dev, comm->mailbox,
+                                          get_mailbox_id(SISCI_RECV, comm->dev->node_offset),
+                                          comm->remote_node_id));
+    }
 
     printf("Try send: state=%u, memory_id=%d, data=%u\n",
-           state,
+           channel->state,
            memhandle->memory_id,
            *(uint32_t*)data);
 
-    if (state != COMM_READY) {
-        *request = NULL;
+    *request = NULL;
+
+    if (channel->state != COMM_READY) {
+        return ncclSuccess;
+    }
+
+    uint32_t remote_offset = 0;
+
+    if (mailbox_read(channel, COMM_FLAG_REQUEST, &remote_offset)) {
         return ncclSuccess;
     }
 
@@ -481,16 +583,10 @@ ncclResult_t ncclSisciIsend(void* sendComm, void* data, int size, void* mhandle,
         }
     }
 
-    if (comm->mailbox->remote_addr == NULL) {
-        NCCLCHECK(ncclSisciConnectMailbox(comm->dev, comm->mailbox,
-                                          get_mailbox_id(SISCI_RECV, comm->dev->node_offset),
-                                          comm->remote_node_id));
-    }
-
     if (size > 0) {
         NCCLCHECK(ncclSCIStartDmaTransfer(comm->dq, memhandle->local_segment,
-                                            memhandle->remote_segment, offset, size,
-                                            offset, NO_CALLBACK, NO_ARG, NO_FLAGS));
+                                            memhandle->remote_segment, local_offset, size,
+                                            remote_offset, NO_CALLBACK, NO_ARG, NO_FLAGS));
     }
 
     req->type = SISCI_SEND;
@@ -500,19 +596,20 @@ ncclResult_t ncclSisciIsend(void* sendComm, void* data, int size, void* mhandle,
     req->data = data;
     req->size = size;
     req->memhandle = memhandle;
-    req->offset = offset;
-    req->local_flag = ((volatile uint32_t*)comm->mailbox->local_addr +
-                       (req->id % REQUEST_BUFFER_SIZE)*2);
-    req->local_size = req->local_flag + 1;
-    req->remote_flag = ((volatile uint32_t*)comm->mailbox->remote_addr +
-                        (req->id % REQUEST_BUFFER_SIZE)*2);
-    req->remote_size = req->remote_flag + 1;
-    req->state = &comm->state[req->id % REQUEST_BUFFER_SIZE];
-    *req->state = SEND_POSTED;
+    req->offset = local_offset;
 
-    printf("Sending request %d: size=%d, offset=%lu, local_segment=%x, remote_segment=%x, checksum=%04x\n",
-           req->id, size, offset, memhandle->segment_id,
-           memhandle->remote_segment_id, fletcher16((uint8_t*)data, size));
+    channel->state = SEND_POSTED;
+    req->channel = channel;
+
+    uint16_t checksum = 0;
+
+    if (memhandle->type == NCCL_PTR_HOST) {
+        checksum = fletcher16((uint8_t*)data, size);
+    }
+
+    printf("Sending request %d: size=%d, local_offset=%lu, remote_offset=%du, local_segment=%x, remote_segment=%x, checksum=%04x\n",
+           req->id, size, local_offset, remote_offset, memhandle->segment_id,
+           memhandle->remote_segment_id, checksum);
 
     *request = req;
 
@@ -526,25 +623,27 @@ ncclResult_t ncclSisciIrecv(void* recvComm, void* data, int size, void* mhandle,
     struct ncclSisciMemHandle *memhandle = (struct ncclSisciMemHandle*)mhandle;
     struct ncclSisciRecvComm *comm = (struct ncclSisciRecvComm*)recvComm;
     size_t offset = (uint8_t*)data - (uint8_t*)memhandle->addr;
-    enum ncclSisciCommState state = comm->state[comm->request_cnt % REQUEST_BUFFER_SIZE];
-
-    printf("Try recv: state=%u, memory_id=%d, data=%u\n",
-           state,
-           memhandle->memory_id,
-           *(uint32_t*)data);
-
-    if (state != COMM_READY) {
-        *request = NULL;
-        return ncclSuccess;
-    }
-
-    NCCLCHECK(ncclCalloc(&req, 1));
+    struct ncclSisciChannel *channel = &comm->channels[comm->request_cnt % REQUEST_BUFFER_SIZE];
 
     if (comm->mailbox->remote_addr == NULL) {
         NCCLCHECK(ncclSisciConnectMailbox(comm->dev, comm->mailbox,
                                           get_mailbox_id(SISCI_SEND, comm->dev->node_offset),
                                           comm->remote_node_id));
     }
+
+    printf("Try recv: state=%u, memory_id=%d\n",
+           channel->state,
+           memhandle->memory_id);
+
+    *request = NULL;
+
+    if (channel->state != COMM_READY) {
+        return ncclSuccess;
+    }
+
+    mailbox_write(channel, COMM_FLAG_REQUEST, offset);
+
+    NCCLCHECK(ncclCalloc(&req, 1));
 
     req->type = SISCI_RECV;
     req->comm = recvComm;
@@ -554,14 +653,9 @@ ncclResult_t ncclSisciIrecv(void* recvComm, void* data, int size, void* mhandle,
     req->size = size;
     req->memhandle = memhandle;
     req->offset = offset;
-    req->local_flag = ((volatile uint32_t*)comm->mailbox->local_addr +
-                       (req->id % REQUEST_BUFFER_SIZE)*2);
-    req->local_size = req->local_flag + 1;
-    req->remote_flag = ((volatile uint32_t*)comm->mailbox->remote_addr +
-                        (req->id % REQUEST_BUFFER_SIZE)*2);
-    req->remote_size = req->remote_flag + 1;
-    req->state = &comm->state[req->id % REQUEST_BUFFER_SIZE];
-    *req->state = RECV_WAITING;
+
+    channel->state = RECV_WAITING;
+    req->channel = channel;
 
     printf("Receiving request %d: size=%d, offset=%lu, segment=%x\n",
            req->id, size, offset, memhandle->segment_id);
@@ -591,43 +685,39 @@ ncclResult_t ncclSisciTest(void* request, int* done, int* size) {
     if (req->type == SISCI_SEND) {
         struct ncclSisciSendComm *comm = (struct ncclSisciSendComm*)req->comm;
 
-        if (*req->state == SEND_POSTED) {
+        if (req->channel->state == SEND_POSTED) {
             sci_dma_queue_state_t state;
             NCCLCHECK(ncclSCIDMAQueueState(&state, comm->dq));
             if (state == SCI_DMAQUEUE_IDLE || state == SCI_DMAQUEUE_DONE) {
                 printf("req->id=%d, SEND_POSTED->SEND_WAIT_ACK\n",
                        req->id);
 
-                *req->remote_size = req->size;
-                *req->remote_flag = COMM_FLAG_NOTIFY;
-                *req->state = SEND_WAIT_ACK;
+                mailbox_write(req->channel, COMM_FLAG_NOTIFY, req->size);
+                req->channel->state = COMM_READY;
+
+                *done = 1;
             }
-        }
-
-        if (*req->state == SEND_WAIT_ACK && *req->local_flag == COMM_FLAG_ACK) {
-            printf("req->id=%d, SEND_WAIT_ACK->COMM_READY\n",
-                   req->id);
-
-            *req->local_flag = COMM_FLAG_EMPTY;
-            *req->state = COMM_READY;
-            *done = 1;
         }
     }
     else {
-        if (*req->state == RECV_WAITING && *req->local_flag == COMM_FLAG_NOTIFY) {
-            req->size = *req->local_size;
+        if (req->channel->state == RECV_WAITING &&
+            mailbox_read(req->channel, COMM_FLAG_NOTIFY, &req->size)) {
 
-            *req->local_flag = COMM_FLAG_EMPTY;
-            *req->state = COMM_READY;
+            req->channel->state = COMM_READY;
 
-            *req->remote_flag = COMM_FLAG_ACK;
             *done = 1;
 
             printf("req->id=%d, RECV_WAITING->COMM_READY\n",
                    req->id);
 
+            uint16_t checksum = 0;
+
+            if (req->memhandle->type == NCCL_PTR_HOST) {
+                checksum = fletcher16((uint8_t*)req->data, req->size);
+            }
+
             printf("Received data: size=%u, offset=%u, checksum=%04x\n",
-                   req->size, req->offset, fletcher16((uint8_t*)req->data, req->size));
+                   req->size, req->offset, checksum);
         }
     }
 
