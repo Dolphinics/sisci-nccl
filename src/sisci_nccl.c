@@ -137,7 +137,6 @@ enum ncclSisciCommType { SISCI_RECV,
 
 enum ncclSisciCommState {COMM_READY,
                          SEND_POSTED,
-                         SEND_WAIT_ACK,
                          RECV_WAITING};
 
 struct ncclSisciChannel {
@@ -555,10 +554,10 @@ ncclResult_t ncclSisciIsend(void* sendComm, void* data, int size, void* mhandle,
                                           comm->remote_node_id));
     }
 
-    printf("Try send: state=%u, memory_id=%d, data=%u\n",
+    printf("Try send: state=%u, memory_id=%d, req->id=%u\n",
            channel->state,
            memhandle->memory_id,
-           *(uint32_t*)data);
+           comm->request_cnt);
 
     *request = NULL;
 
@@ -568,7 +567,7 @@ ncclResult_t ncclSisciIsend(void* sendComm, void* data, int size, void* mhandle,
 
     uint32_t remote_offset = 0;
 
-    if (mailbox_read(channel, COMM_FLAG_REQUEST, &remote_offset)) {
+    if (!mailbox_read(channel, COMM_FLAG_REQUEST, &remote_offset)) {
         return ncclSuccess;
     }
 
@@ -607,7 +606,7 @@ ncclResult_t ncclSisciIsend(void* sendComm, void* data, int size, void* mhandle,
         checksum = fletcher16((uint8_t*)data, size);
     }
 
-    printf("Sending request %d: size=%d, local_offset=%lu, remote_offset=%du, local_segment=%x, remote_segment=%x, checksum=%04x\n",
+    printf("Sending request %d: size=%d, local_offset=%lu, remote_offset=%u, local_segment=%x, remote_segment=%x, checksum=%04x\n",
            req->id, size, local_offset, remote_offset, memhandle->segment_id,
            memhandle->remote_segment_id, checksum);
 
@@ -689,7 +688,7 @@ ncclResult_t ncclSisciTest(void* request, int* done, int* size) {
             sci_dma_queue_state_t state;
             NCCLCHECK(ncclSCIDMAQueueState(&state, comm->dq));
             if (state == SCI_DMAQUEUE_IDLE || state == SCI_DMAQUEUE_DONE) {
-                printf("req->id=%d, SEND_POSTED->SEND_WAIT_ACK\n",
+                printf("req->id=%d, SEND_POSTED->COMM_READY\n",
                        req->id);
 
                 mailbox_write(req->channel, COMM_FLAG_NOTIFY, req->size);
