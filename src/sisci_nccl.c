@@ -749,7 +749,9 @@ ncclResult_t ncclSisciFlush(void* recvComm, void* data, int size, void* mhandle)
     UNUSED(size);
     UNUSED(mhandle);
 
-    return ncclInternalError;
+    /* This is a no-op now, but not sure if we should be doing something here. */
+
+    return ncclSuccess;
 }
 
 // Test whether a request is complete. If size is not NULL, it returns the
