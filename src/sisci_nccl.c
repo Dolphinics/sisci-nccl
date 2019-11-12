@@ -490,7 +490,21 @@ void* devptr(void* ptr)
     return attrs.devicePointer;
 }
 
-#define GPU_BOUND_SHIFT   16
+/* NCCL calls RegMr twice for each comm, with two pointers that point
+   to the same memory block, but with different offsets and
+   sizes. There is an overlapping page between these two areas, which
+   for some reasons results in non-contiguous pages when using
+   nvidia_p2p_get_pages in SCIAttachPhysicalMemory. As a workaround,
+   we attach the whole CUDA memory block for both pointers, using
+   offsets to read/write the correct memory location. This is a bit
+   hackish, because we make som assumptions on the size and alignement
+   of the GPU memory, causing any upstream changes will to this. */
+#define GPU_SIZE          0x441000 /* We know this size from net.cc */
+#define GPU_BOUND_SHIFT   20       /* The memory returned by
+                                      cudaMalloc appears to always be
+                                      1MB aligned. Not sure if this
+                                      holds across platforms and
+                                      version. */
 #define GPU_BOUND_SIZE    ((uint64_t)1 << GPU_BOUND_SHIFT)
 #define GPU_BOUND_OFFSET  (GPU_BOUND_SIZE-1)
 #define GPU_BOUND_MASK    (~GPU_BOUND_OFFSET)
@@ -522,32 +536,31 @@ ncclResult_t ncclSisciRegMr(void* comm, void* data, int size, int type, void** m
          data, size, type == NCCL_PTR_HOST ? "host" : "cuda",
          memhandle->segment_id, memhandle->remote_segment_id);
 
-
-    // memhandle->addr = devptr(data);
     memhandle->addr = data;
     memhandle->type = type;
 
     NCCLCHECK(ncclSCIOpen(&memhandle->sd, NO_FLAGS));
 
     if (type == NCCL_PTR_CUDA) {
+        /* void *dptr = devptr(memhandle->addr); */
+        devptr_set_sync_memops(memhandle->addr);
 
-        // memhandle->addr = devptr(data);
-        void *dptr = devptr(memhandle->addr);
-        devptr_set_sync_memops(dptr);
-        uint64_t start = (uint64_t)dptr & GPU_BOUND_MASK;
-        size_t pin_size = (uint64_t)dptr + size - start;
-        memhandle->offset = (uint64_t)dptr - start;
+        /* Map the whole memory block */
+        uint64_t start = (uint64_t)memhandle->addr & GPU_BOUND_MASK;
+        size_t pin_size = GPU_SIZE;
 
+        /* Set addr to start of block for correct offset calculations
+           in send/recv. */
         memhandle->addr = (void*)start;
 
-        INFO(NCCL_NET, "CUDA: aligned=%p, pin_size=0x%lx, offset=0x%lx",
-             (void*)start, pin_size, memhandle->offset);
+        INFO(NCCL_NET, "CUDA: aligned=%p, pin_size=0x%lx",
+             (void*)start, pin_size);
 
         NCCLCHECK(ncclSCICreateSegment(memhandle->sd, &memhandle->local_segment,
-                                       memhandle->segment_id, size,
+                                       memhandle->segment_id, pin_size,
                                        NO_CALLBACK, NO_ARG, SCI_FLAG_EMPTY));
 
-        NCCLCHECK(ncclSCIAttachPhysicalMemory(0, (void*)start, 0, size,
+        NCCLCHECK(ncclSCIAttachPhysicalMemory(0, (void*)start, 0, pin_size,
                                               memhandle->local_segment,
                                               SCI_FLAG_CUDA_BUFFER));
 
@@ -558,14 +571,13 @@ ncclResult_t ncclSisciRegMr(void* comm, void* data, int size, int type, void** m
 
         NCCLCHECK(ncclSCIRegisterSegmentMemory(memhandle->addr, size,
                                                memhandle->local_segment,
-                                               NO_FLAGS));
-        memhandle->offset = 0;
+                                               SCI_FLAG_LOCK_USER_MEM));
     }
 
     NCCLCHECK(ncclSCIPrepareSegment(memhandle->local_segment, gcomm->dev->adapter_no,
-                                      NO_FLAGS));
+                                    NO_FLAGS));
     NCCLCHECK(ncclSCISetSegmentAvailable(memhandle->local_segment, gcomm->dev->adapter_no,
-                                           NO_FLAGS));
+                                         NO_FLAGS));
 
     *mhandle = memhandle;
 
