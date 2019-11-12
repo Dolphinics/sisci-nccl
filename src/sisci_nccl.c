@@ -29,7 +29,7 @@
 #define SEGMENT_PREFIX        0xba000000
 #define NOT_MAILBOX           0
 #define IS_MAILBOX            1
-#define REQUEST_BUFFER_SIZE   32
+#define CHANNELS              4
 #define IR_DATA_SIZE          2
 
 #define COMM_FLAG_EMPTY   0
@@ -156,10 +156,11 @@ struct ncclSisciChannel {
     unsigned int id;
     enum ncclSisciCommState state;
     struct ncclSisciMailbox *mailbox;
+    sci_desc_t sd;
+    sci_dma_queue_t dq;
 };
 
 struct ncclSisciComm {
-    sci_desc_t sd;
     enum ncclSisciCommType type;
     unsigned int mem_handle_cnt;
     unsigned int remote_node_offset;
@@ -167,9 +168,8 @@ struct ncclSisciComm {
     int remote_cuda_device;
     struct ncclSisciDev *dev;
     struct ncclSisciMailbox *mailbox;
-    sci_dma_queue_t dq;
     unsigned int request_cnt;
-    struct ncclSisciChannel channels[REQUEST_BUFFER_SIZE];
+    struct ncclSisciChannel channels[CHANNELS];
 };
 
 #define ncclSisciRecvComm ncclSisciComm
@@ -274,7 +274,7 @@ static ncclResult_t ncclSisciCreateMailbox(struct ncclSisciComm *comm,
     NCCLCHECK(ncclSCIOpen(&mbox->sd, NO_FLAGS));
     NCCLCHECK(ncclSCICreateSegment(mbox->sd, &mbox->local_segment,
                                    mbox->local_id,
-                                   MAILBOX_SEGMENT_SIZE*REQUEST_BUFFER_SIZE*sizeof(uint32_t),
+                                   MAILBOX_SEGMENT_SIZE*CHANNELS*sizeof(uint32_t),
                                    NO_CALLBACK, NO_ARG, NO_FLAGS));
 
     NCCLCHECK(ncclSCIPrepareSegment(mbox->local_segment, comm->dev->adapter_no,
@@ -332,15 +332,38 @@ static ncclResult_t ncclSisciConnectMailbox(struct ncclSisciMailbox *mailbox) {
     return ncclSuccess;
 }
 
-static void ncclSisciInitChannels(struct ncclSisciChannel *channels,
-                                  struct ncclSisciMailbox *mailbox) {
-    for (unsigned int i = 0; i < REQUEST_BUFFER_SIZE; i++) {
+static ncclResult_t ncclSisciInitChannels(struct ncclSisciChannel *channels,
+                                          struct ncclSisciMailbox *mailbox,
+                                          enum ncclSisciCommType type) {
+    for (unsigned int i = 0; i < CHANNELS; i++) {
         struct ncclSisciChannel *channel = channels + i;
 
         channel->id = i;
         channel->mailbox = mailbox;
         channel->state = COMM_READY;
+        if (type == SISCI_SEND) {
+            NCCLCHECK(ncclSCIOpen(&channel->sd, NO_FLAGS));
+            NCCLCHECK(ncclSCICreateDMAQueue(channel->sd, &channel->dq,
+                                            mailbox->dev->adapter_no,
+                                            1, NO_FLAGS));
+        }
+
     }
+
+    return ncclSuccess;
+}
+
+static ncclResult_t ncclSisciRemoveChannels(struct ncclSisciChannel *channels) {
+    for (unsigned int i = 0; i < CHANNELS; i++) {
+        struct ncclSisciChannel *channel = channels + i;
+
+        if (channel->dq != NULL) {
+            NCCLCHECK(ncclSCIRemoveDMAQueue(channel->dq, NO_FLAGS));
+            NCCLCHECK(ncclSCIClose(channel->sd, NO_FLAGS));
+        }
+    }
+
+    return ncclSuccess;
 }
 
 static void mailbox_write(struct ncclSisciChannel *channel,
@@ -385,24 +408,24 @@ ncclResult_t ncclSisciConnect(int dev, void* opaqueHandle, void** sendComm) {
 
     INFO(NCCL_NET, "Connecting to node %d on %d", handle->node_id, handle->irno);
 
+    sci_desc_t sd;
     sci_remote_data_interrupt_t ir;
     uint32_t data[IR_DATA_SIZE];
     data[0] = htons(comm->dev->node_offset);
     data[1] = htons(cuda_device);
 
-    NCCLCHECK(ncclSCIOpen(&comm->sd, NO_FLAGS));
-    NCCLCHECK(ncclSCIConnectDataInterrupt(comm->sd, &ir, handle->node_id,
+    NCCLCHECK(ncclSCIOpen(&sd, NO_FLAGS));
+    NCCLCHECK(ncclSCIConnectDataInterrupt(sd, &ir, handle->node_id,
                                 comm->dev->adapter_no, handle->irno,
                                 INFINITE_TIMEOUT, NO_FLAGS));
     NCCLCHECK(ncclSCITriggerDataInterrupt(ir, &data, sizeof(*data)*IR_DATA_SIZE,
                                           NO_FLAGS));
     NCCLCHECK(ncclSCIDisconnectDataInterrupt(ir, NO_FLAGS));
+    NCCLCHECK(ncclSCIClose(sd, NO_FLAGS));
 
     NCCLCHECK(ncclSisciCreateMailbox(comm, &comm->mailbox));
-    ncclSisciInitChannels(comm->channels, comm->mailbox);
-
-    NCCLCHECK(ncclSCICreateDMAQueue(comm->sd, &comm->dq, comm->dev->adapter_no,
-                                      128, NO_FLAGS));
+    NCCLCHECK(ncclSisciInitChannels(comm->channels, comm->mailbox,
+                                    comm->type));
 
     *sendComm = comm;
 
@@ -429,7 +452,8 @@ ncclResult_t ncclSisciAccept(void* listenComm, void** recvComm) {
     rcomm->remote_node_id = (rcomm->remote_node_offset+1)*4;
 
     NCCLCHECK(ncclSisciCreateMailbox(rcomm, &rcomm->mailbox));
-    ncclSisciInitChannels(rcomm->channels, rcomm->mailbox);
+    NCCLCHECK(ncclSisciInitChannels(rcomm->channels, rcomm->mailbox,
+                                    rcomm->type));
 
     INFO(NCCL_NET, "Accepted connection from node %d", rcomm->remote_node_id);
 
@@ -591,7 +615,7 @@ ncclResult_t ncclSisciIsend(void* sendComm, void* data, int size, void* mhandle,
     struct ncclSisciMemHandle *memhandle = (struct ncclSisciMemHandle*)mhandle;
     struct ncclSisciRequest *req;
     size_t local_offset = (uint8_t*)data - (uint8_t*)memhandle->addr;
-    struct ncclSisciChannel *channel = &comm->channels[comm->request_cnt % REQUEST_BUFFER_SIZE];
+    struct ncclSisciChannel *channel = &comm->channels[comm->request_cnt % CHANNELS];
 
     if (comm->mailbox->remote_addr == NULL) {
         NCCLCHECK(ncclSisciConnectMailbox(comm->mailbox));
@@ -625,12 +649,6 @@ ncclResult_t ncclSisciIsend(void* sendComm, void* data, int size, void* mhandle,
         }
     }
 
-    if (size > 0) {
-        NCCLCHECK(ncclSCIStartDmaTransfer(comm->dq, memhandle->local_segment,
-                                            memhandle->remote_segment, local_offset, size,
-                                            remote_offset, NO_CALLBACK, NO_ARG, NO_FLAGS));
-    }
-
     req->type = SISCI_SEND;
     req->comm = sendComm;
     req->memory_id = memhandle->memory_id;
@@ -640,18 +658,24 @@ ncclResult_t ncclSisciIsend(void* sendComm, void* data, int size, void* mhandle,
     req->memhandle = memhandle;
     req->offset = local_offset;
 
-    channel->state = SEND_POSTED;
-    req->channel = channel;
-
     uint16_t checksum = 0;
 
     /* if (memhandle->type == NCCL_PTR_HOST) { */
     /*     checksum = fletcher16((uint8_t*)data, size); */
     /* } */
 
-    INFO(NCCL_NET, "Sending request %d: node=%d, size=%d, local_offset=%lu, remote_offset=%u, local_segment=%x, remote_segment=%x, checksum=%04x",
+    INFO(NCCL_NET, "Sending request %d: node=%d, size=0x%x, local_offset=0x%x, remote_offset=0x%x, local_segment=0x%x, remote_segment=0x%x, checksum=%04x",
          req->id, comm->remote_node_id, size, local_offset, remote_offset,
          memhandle->segment_id, memhandle->remote_segment_id, checksum);
+
+    if (size > 0) {
+        NCCLCHECK(ncclSCIStartDmaTransfer(channel->dq, memhandle->local_segment,
+                                          memhandle->remote_segment, local_offset, size,
+                                          remote_offset, NO_CALLBACK, NO_ARG, NO_FLAGS));
+    }
+
+    channel->state = SEND_POSTED;
+    req->channel = channel;
 
     *request = req;
 
@@ -665,7 +689,7 @@ ncclResult_t ncclSisciIrecv(void* recvComm, void* data, int size, void* mhandle,
     struct ncclSisciMemHandle *memhandle = (struct ncclSisciMemHandle*)mhandle;
     struct ncclSisciRecvComm *comm = (struct ncclSisciRecvComm*)recvComm;
     size_t offset = (uint8_t*)data - (uint8_t*)memhandle->addr;
-    struct ncclSisciChannel *channel = &comm->channels[comm->request_cnt % REQUEST_BUFFER_SIZE];
+    struct ncclSisciChannel *channel = &comm->channels[comm->request_cnt % CHANNELS];
 
     if (comm->mailbox->remote_addr == NULL) {
         NCCLCHECK(ncclSisciConnectMailbox(comm->mailbox));
@@ -723,11 +747,9 @@ ncclResult_t ncclSisciTest(void* request, int* done, int* size) {
     *done = 0;
 
     if (req->type == SISCI_SEND) {
-        struct ncclSisciSendComm *comm = (struct ncclSisciSendComm*)req->comm;
-
         if (req->channel->state == SEND_POSTED) {
             sci_dma_queue_state_t state;
-            NCCLCHECK(ncclSCIDMAQueueState(&state, comm->dq));
+            NCCLCHECK(ncclSCIDMAQueueState(&state, req->channel->dq));
             if (state == SCI_DMAQUEUE_IDLE || state == SCI_DMAQUEUE_DONE) {
                 INFO(NCCL_NET, "req->id=%d, SEND_POSTED->COMM_READY",
                      req->id);
@@ -775,8 +797,7 @@ ncclResult_t ncclSisciCloseSend(void* sendComm) {
     struct ncclSisciSendComm *comm = (struct ncclSisciSendComm*)sendComm;
 
     NCCLCHECK(ncclSisciRemoveMailbox(comm->dev, comm->mailbox));
-    NCCLCHECK(ncclSCIRemoveDMAQueue(comm->dq, NO_FLAGS));
-    NCCLCHECK(ncclSCIClose(comm->sd, NO_FLAGS));
+    NCCLCHECK(ncclSisciRemoveChannels(comm->channels));
 
     free(sendComm);
 
@@ -786,6 +807,7 @@ ncclResult_t ncclSisciCloseRecv(void* recvComm) {
     struct ncclSisciRecvComm *comm = (struct ncclSisciRecvComm*)recvComm;
 
     NCCLCHECK(ncclSisciRemoveMailbox(comm->dev, comm->mailbox));
+    NCCLCHECK(ncclSisciRemoveChannels(comm->channels));
 
     free(recvComm);
 
