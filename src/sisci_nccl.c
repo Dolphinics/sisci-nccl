@@ -24,7 +24,6 @@
 #define NO_ARG                NULL
 #define MAX_SCI_DEVS          4
 #define MAILBOX_SEGMENT_SIZE  2
-#define INFINITE_TIMEOUT      0xffffffff
 #define MAX_NODES             60
 #define SEGMENT_PREFIX        0xba000000
 #define NOT_MAILBOX           0
@@ -144,9 +143,6 @@ struct ncclSisciListenComm {
     struct ncclSisciDev *dev;
     sci_desc_t sd;
     sci_local_data_interrupt_t ir;
-    sci_local_segment_t segment;
-    sci_map_t map;
-    volatile void *addr;
 };
 
 struct ncclSisciMailbox {
@@ -194,25 +190,18 @@ struct ncclSisciComm {
 #define ncclSisciSendComm ncclSisciComm
 
 struct ncclSisciMemHandle {
+    unsigned int id;
     sci_desc_t sd;
     sci_local_segment_t local_segment;
     sci_remote_segment_t remote_segment;
     unsigned int segment_id;
     unsigned int remote_segment_id;
-    unsigned int memory_id;
-    sci_map_t map;
-    volatile void *segment_addr;
     void *addr;
-    unsigned int busy;
-    uint64_t offset;
-    int type;
 };
 
 struct ncclSisciRequest {
-    enum ncclSisciCommType type;
-    void *comm;
-    unsigned int memory_id;
     unsigned int id;
+    enum ncclSisciCommType type;
     void *data;
     unsigned int size;
     unsigned int offset;
@@ -335,7 +324,7 @@ static ncclResult_t ncclSisciConnectMailbox(struct ncclSisciMailbox *mailbox) {
     while (ncclSCIConnectSegment(mailbox->sd, &mailbox->remote_segment,
                                  mailbox->remote_node_id,
                                  mailbox->remote_id, mailbox->dev->adapter_no,
-                                 NO_CALLBACK, NO_ARG, INFINITE_TIMEOUT,
+                                 NO_CALLBACK, NO_ARG, SCI_INFINITE_TIMEOUT,
                                  NO_FLAGS) != ncclSuccess) {
         sleep(1);
     }
@@ -435,7 +424,7 @@ ncclResult_t ncclSisciConnect(int dev, void* opaqueHandle, void** sendComm) {
     NCCLCHECK(ncclSCIOpen(&sd, NO_FLAGS));
     NCCLCHECK(ncclSCIConnectDataInterrupt(sd, &ir, handle->node_id,
                                 comm->dev->adapter_no, handle->irno,
-                                INFINITE_TIMEOUT, NO_FLAGS));
+                                SCI_INFINITE_TIMEOUT, NO_FLAGS));
     NCCLCHECK(ncclSCITriggerDataInterrupt(ir, &data, sizeof(*data)*IR_DATA_SIZE,
                                           NO_FLAGS));
     NCCLCHECK(ncclSCIDisconnectDataInterrupt(ir, NO_FLAGS));
@@ -463,7 +452,7 @@ ncclResult_t ncclSisciAccept(void* listenComm, void** recvComm) {
     rcomm->dev = lcomm->dev;
     rcomm->type = SISCI_RECV;
 
-    NCCLCHECK(ncclSCIWaitForDataInterrupt(lcomm->ir, &data, &size, INFINITE_TIMEOUT,
+    NCCLCHECK(ncclSCIWaitForDataInterrupt(lcomm->ir, &data, &size, SCI_INFINITE_TIMEOUT,
                                             NO_FLAGS));
     rcomm->remote_node_offset = ntohs(data[0]);
     rcomm->remote_cuda_device = ntohs(data[1]);
@@ -535,19 +524,19 @@ ncclResult_t ncclSisciRegMr(void* comm, void* data, int size, int type, void** m
 
     struct ncclSisciMemHandle *memhandle;
     NCCLCHECK(ncclCalloc(&memhandle, 1));
-    memhandle->memory_id = gcomm->mem_handle_cnt++;
+    memhandle->id = gcomm->mem_handle_cnt++;
     memhandle->segment_id = get_segment_id(gcomm->dev->node_offset,
                                            gcomm->remote_node_offset,
                                            cuda_device,
                                            NOT_MAILBOX,
-                                           memhandle->memory_id,
+                                           memhandle->id,
                                            gcomm->type);
 
     memhandle->remote_segment_id = get_segment_id(gcomm->remote_node_offset,
                                                   gcomm->dev->node_offset,
                                                   gcomm->remote_cuda_device,
                                                   NOT_MAILBOX,
-                                                  memhandle->memory_id,
+                                                  memhandle->id,
                                                   (gcomm->type == SISCI_SEND ? SISCI_RECV : SISCI_SEND));
 
     INFO(NCCL_NET, "RegMr: ptr=%p, size=0x%x, type=%s, local_segment=0x%x, remote_segment=0x%x",
@@ -555,7 +544,6 @@ ncclResult_t ncclSisciRegMr(void* comm, void* data, int size, int type, void** m
          memhandle->segment_id, memhandle->remote_segment_id);
 
     memhandle->addr = data;
-    memhandle->type = type;
 
     NCCLCHECK(ncclSCIOpen(&memhandle->sd, NO_FLAGS));
 
@@ -680,8 +668,6 @@ ncclResult_t ncclSisciIsend(void* sendComm, void* data, int size, void* mhandle,
     }
 
     req->type = SISCI_SEND;
-    req->comm = sendComm;
-    req->memory_id = memhandle->memory_id;
     req->id = comm->request_cnt++;
     req->data = data;
     req->size = size;
@@ -727,7 +713,7 @@ ncclResult_t ncclSisciIrecv(void* recvComm, void* data, int size, void* mhandle,
 
     INFO(NCCL_NET, "Try recv: state=%u, memory_id=%d",
          channel->state,
-         memhandle->memory_id);
+         memhandle->id);
 
     *request = NULL;
 
@@ -740,8 +726,6 @@ ncclResult_t ncclSisciIrecv(void* recvComm, void* data, int size, void* mhandle,
     NCCLCHECK(ncclCalloc(&req, 1));
 
     req->type = SISCI_RECV;
-    req->comm = recvComm;
-    req->memory_id = memhandle->memory_id;
     req->id = comm->request_cnt++;
     req->data = data;
     req->size = size;
