@@ -98,10 +98,28 @@ ncclResult_t ncclSisciDevices(int* ndev) {
 
 // Return the device path in /sys. NCCL will call free on this path.
 ncclResult_t ncclSisciPciPath(int dev, char** path) {
-    UNUSED(dev);
+    struct ncclSisciDev *devp = &ncclSisciDevs[dev];
     char devicepath[PATH_MAX];
-    strcpy(devicepath, "/sys/class/pci_bus/0000:da/device/0000:da:00.0/");
+    sci_query_adapter_t query;
+    uint16_t bdf;
+    uint8_t bus;
+    uint8_t device;
+
+    query.subcommand = SCI_Q_ADAPTER_BDF;
+    query.localAdapterNo = devp->adapter_no;
+    query.data = &bdf;
+    NCCLCHECK(ncclSCIQuery(SCI_Q_ADAPTER, &query,
+                           NO_FLAGS));
+    bus = bdf >> 8;
+    device = bdf & 0x00ff;
+
+    snprintf(devicepath, PATH_MAX,
+             "/sys/class/pci_bus/0000:%02x/device/0000:%02x:%02x.0/",
+             bus, bus, device);
     *path = realpath(devicepath, NULL);
+
+    INFO(NCCL_NET, "Adapter %d path: %s", devp->adapter_no,
+         devicepath);
 
     return ncclSuccess;
 }
