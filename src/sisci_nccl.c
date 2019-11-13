@@ -36,14 +36,15 @@
 #define COMM_FLAG_NOTIFY  2
 
 struct ncclSisciDev {
-    unsigned int available;
     unsigned int adapter_no;
     unsigned int node_id;
     unsigned int node_offset;
 };
 
 struct ncclSisciDev ncclSisciDevs[MAX_SCI_DEVS];
+
 int cuda_device;
+int ncclSisciNDevs = -1;
 
 pthread_mutex_t ncclSisciLock = PTHREAD_MUTEX_INITIALIZER;
 
@@ -51,33 +52,41 @@ pthread_mutex_t ncclSisciLock = PTHREAD_MUTEX_INITIALIZER;
 ncclResult_t ncclSisciInit(ncclDebugLogger_t logFunction) {
     ncclDebugLog = logFunction;
 
-    INFO(NCCL_NET|NCCL_INIT, "Trying to load SISCI");
-    NCCLCHECK(ncclSCIInitialize(NO_FLAGS));
+    pthread_mutex_lock(&ncclSisciLock);
+    if (ncclSisciNDevs == -1) {
+        INFO(NCCL_NET|NCCL_INIT, "Trying to load SISCI");
+        NCCLCHECK(ncclSCIInitialize(NO_FLAGS));
 
-    cudaError_t err = cudaGetDevice(&cuda_device);
-    if (err != cudaSuccess)
-    {
-        WARN("Failed to get current GPU: %s", cudaGetErrorString(err));
-        return ncclInternalError;
+        cudaError_t err = cudaGetDevice(&cuda_device);
+        if (err != cudaSuccess) {
+            WARN("Failed to get current GPU: %s", cudaGetErrorString(err));
+            return ncclInternalError;
+        }
+
+        ncclSisciNDevs = 0;
+        for (int i = 0; i < MAX_SCI_DEVS; i++) {
+            struct ncclSisciDev *dev = &ncclSisciDevs[i];
+
+            dev->adapter_no = i;
+
+            if (ncclSCIGetLocalNodeId(dev->adapter_no, &dev->node_id, NO_FLAGS) ==
+                ncclSuccess) {
+                INFO(NCCL_INIT|NCCL_NET, "NET/SISCI : adapter %u, node id %u",
+                     dev->adapter_no, dev->node_id);
+
+                dev->node_offset = (dev->node_id >> 2) - 1;
+
+                ncclSisciNDevs++;
+            }
+            else {
+                break;
+            }
+        }
     }
+    pthread_mutex_unlock(&ncclSisciLock);
 
-    for (int i = 0; i < MAX_SCI_DEVS; i++) {
-        struct ncclSisciDev *dev = &ncclSisciDevs[i];
-
-        dev->adapter_no = i;
-
-        if (ncclSCIGetLocalNodeId(dev->adapter_no, &dev->node_id, NO_FLAGS) ==
-            ncclSuccess) {
-            INFO(NCCL_INIT|NCCL_NET, "NET/SISCI : adapter %u, node id %u",
-                 dev->adapter_no, dev->node_id);
-
-            dev->node_offset = (dev->node_id >> 2) - 1;
-
-            dev->available = 1;
-        }
-        else {
-            break;
-        }
+    if (ncclSisciNDevs == 0) {
+        INFO(NCCL_INIT|NCCL_NET, "NET/SISCI : No devices found.");
     }
 
     return ncclSuccess;
@@ -85,12 +94,7 @@ ncclResult_t ncclSisciInit(ncclDebugLogger_t logFunction) {
 
 // Return the number of adapters.
 ncclResult_t ncclSisciDevices(int* ndev) {
-    for (int i = 0; i < MAX_SCI_DEVS; i++) {
-        if (ncclSisciDevs[i].available == 0) {
-            *ndev = i;
-            break;
-        }
-    }
+    *ndev = ncclSisciNDevs;
 
     return ncclSuccess;
 }
