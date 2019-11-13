@@ -473,32 +473,20 @@ ncclResult_t ncclSisciAccept(void* listenComm, void** recvComm) {
     return ncclSuccess;
 }
 
-void devptr_set_sync_memops(void* dev_ptr)
+ncclResult_t devptr_set_sync_memops(void* dev_ptr)
 {
     unsigned flag = 1;
-
-    CUresult err = cuPointerSetAttribute(&flag, CU_POINTER_ATTRIBUTE_SYNC_MEMOPS, (CUdeviceptr) dev_ptr);
+    CUresult err = cuPointerSetAttribute(&flag,
+                                         CU_POINTER_ATTRIBUTE_SYNC_MEMOPS,
+                                         (CUdeviceptr) dev_ptr);
 
     if (err != CUDA_SUCCESS)
     {
         WARN("Failed to set pointer attribute CU_POINTER_ATTRIBYTE_SYNC_MEMOPS");
-    }
-}
-
-void* devptr(void* ptr)
-{
-    struct cudaPointerAttributes attrs;
-    cudaError_t err;
-
-    err = cudaPointerGetAttributes(&attrs, ptr);
-    if (err != cudaSuccess)
-    {
-        WARN("Failed to get pointer attributes: %s", cudaGetErrorString(err));
-        return NULL;
+        return ncclInternalError;
     }
 
-    INFO(NCCL_NET, "CUDA device buffer %p has device ptr %p", ptr, attrs.devicePointer);
-    return attrs.devicePointer;
+    return ncclSuccess;
 }
 
 /* NCCL calls RegMr twice for each comm, with two pointers that point
@@ -552,8 +540,7 @@ ncclResult_t ncclSisciRegMr(void* comm, void* data, int size, int type, void** m
     NCCLCHECK(ncclSCIOpen(&memhandle->sd, NO_FLAGS));
 
     if (type == NCCL_PTR_CUDA) {
-        /* void *dptr = devptr(memhandle->addr); */
-        devptr_set_sync_memops(memhandle->addr);
+        NCCLCHECK(devptr_set_sync_memops(memhandle->addr));
 
         /* Map the whole memory block */
         uint64_t start = (uint64_t)memhandle->addr & GPU_BOUND_MASK;
