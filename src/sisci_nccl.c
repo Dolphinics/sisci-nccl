@@ -4,13 +4,7 @@
 #include <assert.h>
 #include <pthread.h>
 #include <stdio.h>
-#include <limits.h>
-#include <stdlib.h>
-#include <string.h>
-#include <poll.h>
-#include <sys/types.h>
 #include <unistd.h>
-#include <stdint.h>
 #include <arpa/inet.h>
 
 #include <cuda.h>
