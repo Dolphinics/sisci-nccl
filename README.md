@@ -6,7 +6,7 @@ using frameworks such as [TensorFlow](https://www.tensorflow.org/) and [PyTorch]
 Requirements
 ------------
 * Linux (tested on Ubuntu 18.04)
-* NVIDIA Quadro or Tesla GPU (for GPUDirect RDMA support)
+* NVIDIA GPU (Quadro or Tesla GPU for GPUDirect RDMA support)
 * [Dolphin Interconnect Solutions](http://dolphinics.com) software stack and
   supported hardware.
 * CUDA (tested with 10.0)
@@ -46,11 +46,14 @@ NCCL INFO NET/SISCI : adapter 0, node id 4
 Troubleshooting
 --------------
 
-### No plugin found
-
-```
-NCCL INFO NET/Plugin : No plugin found (libnccl-net.so).
-```
+##### `NCCL INFO NET/Plugin : No plugin found (libnccl-net.so)`
 
 Make sure that the plugin is found either by adding the library install path (defaults to `/usr/local/lib`) to the `LD_LIBRARY_PATH`
 environment variable or to `/etc/ld.so.conf`.
+
+##### `NCCL WARN SCIAttachPhysicalMemory: Out of hardware resources`
+
+The GPU doesn't support GPUDirect RDMA. To disable GDR, run:
+```
+export NCCL_NET_GDR_LEVEL=0
+```
