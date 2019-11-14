@@ -613,21 +613,6 @@ ncclResult_t ncclSisciDeregMr(void* comm, void* mhandle) {
     return ncclSuccess;
 }
 
-uint16_t fletcher16( uint8_t *data, int count )
-{
-   uint16_t sum1 = 0;
-   uint16_t sum2 = 0;
-   int index;
-
-   for ( index = 0; index < count; ++index )
-   {
-      sum1 = (sum1 + data[index]) % 255;
-      sum2 = (sum2 + sum1) % 255;
-   }
-
-   return (sum2 << 8) | sum1;
-}
-
 // Asynchronous send to a peer.
 // May return request == NULL if the call cannot be performed (or would block)
 ncclResult_t ncclSisciIsend(void* sendComm, void* data, int size, void* mhandle, void** request) {
@@ -640,11 +625,6 @@ ncclResult_t ncclSisciIsend(void* sendComm, void* data, int size, void* mhandle,
     if (comm->mailbox->remote_addr == NULL) {
         NCCLCHECK(ncclSisciConnectMailbox(comm->mailbox));
     }
-
-    /* printf("Try send: state=%u, memory_id=%d, req->id=%u\n", */
-    /*        channel->state, */
-    /*        memhandle->memory_id, */
-    /*        comm->request_cnt); */
 
     *request = NULL;
 
@@ -676,15 +656,9 @@ ncclResult_t ncclSisciIsend(void* sendComm, void* data, int size, void* mhandle,
     req->memhandle = memhandle;
     req->offset = local_offset;
 
-    uint16_t checksum = 0;
-
-    /* if (memhandle->type == NCCL_PTR_HOST) { */
-    /*     checksum = fletcher16((uint8_t*)data, size); */
-    /* } */
-
-    INFO(NCCL_NET, "Sending request %d: node=%d, size=0x%x, local_offset=0x%x, remote_offset=0x%x, local_segment=0x%x, remote_segment=0x%x, checksum=%04x",
+    INFO(NCCL_NET, "Sending request %d: node=%d, size=0x%x, local_offset=0x%x, remote_offset=0x%x, local_segment=0x%x, remote_segment=0x%x",
          req->id, comm->remote_node_id, size, local_offset, remote_offset,
-         memhandle->segment_id, memhandle->remote_segment_id, checksum);
+         memhandle->segment_id, memhandle->remote_segment_id);
 
     if (size > 0) {
         NCCLCHECK(ncclSCIStartDmaTransfer(channel->dq, memhandle->local_segment,
@@ -789,15 +763,8 @@ ncclResult_t ncclSisciTest(void* request, int* done, int* size) {
 
             INFO(NCCL_NET, "req->id=%d, RECV_WAITING->COMM_READY",
                  req->id);
-
-            uint16_t checksum = 0;
-
-            /* if (req->memhandle->type == NCCL_PTR_HOST) { */
-            /*     checksum = fletcher16((uint8_t*)req->data, req->size); */
-            /* } */
-
-            INFO(NCCL_NET, "Received data: size=0x%x, offset=0x%x, checksum=%04x",
-                 req->size, req->offset, checksum);
+            INFO(NCCL_NET, "Received data: size=0x%x, offset=0x%x",
+                 req->size, req->offset);
         }
     }
 
