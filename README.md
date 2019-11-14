@@ -43,6 +43,11 @@ NCCL INFO Trying to load SISCI
 NCCL INFO NET/SISCI : adapter 0, node id 4
 ```
 
+### GPUDirect RDMA (GDR)
+
+Use the [`NCCL_NET_GDR_LEVEL` enviromental variable](https://docs.nvidia.com/deeplearning/sdk/nccl-developer-guide/docs/env.html#nccl-net-gdr-level-formerly-nccl-ib-gdr-level) to control the use of GDR. Run the [NCCL tests](https://github.com/nvidia/nccl-tests) to evaluate performance.
+
+
 Troubleshooting
 --------------
 
