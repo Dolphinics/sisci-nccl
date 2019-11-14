@@ -726,7 +726,7 @@ ncclResult_t ncclSisciIrecv(void* recvComm, void* data, int size, void* mhandle,
     channel->state = RECV_WAITING;
     req->channel = channel;
 
-    INFO(NCCL_NET, "Receiving request %d: node=%d, size=%d, offset=%lu, segment=%x",
+    INFO(NCCL_NET, "Receiving request %d: node=%d, size=0x%x, offset=0x%x, segment=0x%x",
          req->id, comm->remote_node_id, size, offset, memhandle->segment_id);
 
     *request = req;
@@ -785,7 +785,7 @@ ncclResult_t ncclSisciTest(void* request, int* done, int* size) {
             /*     checksum = fletcher16((uint8_t*)req->data, req->size); */
             /* } */
 
-            INFO(NCCL_NET, "Received data: size=%u, offset=%u, checksum=%04x",
+            INFO(NCCL_NET, "Received data: size=0x%x, offset=0x%x, checksum=%04x",
                  req->size, req->offset, checksum);
         }
     }
