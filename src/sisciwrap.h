@@ -9,31 +9,32 @@
 
 #include "sisci_nccl.h"
 
-static ncclResult_t handle_sisci_error(const char *filename, int lineno, const char *function,
-                                       sci_error_t error, int quiet) {
-  if (error != SCI_ERR_OK) {
-      if (!quiet) {
-          WARN("%s:%d: %s: %s", filename, lineno, function,
-               SCIGetErrorString(error));
-      }
-    return ncclInternalError;
-  }
+#define SISCI_CHECK(function, error, quiet)                             \
+    ({                                                                  \
+        ncclResult_t result = ncclSuccess;                              \
+        if (error != SCI_ERR_OK) {                                      \
+            if (!quiet) {                                               \
+                WARN("%s: %s", function,                                \
+                     SCIGetErrorString(error));                         \
+            }                                                           \
+            result = ncclInternalError;                                 \
+        }                                                               \
+        result;                                                         \
+    })                                                                  \
 
-  return ncclSuccess;
-}
 
-#define SISCI_WRAP(fn, ...) \
-    ({                      \
-    sci_error_t err; \
-    fn(__VA_ARGS__, &err); \
-    handle_sisci_error(__FILE__, __LINE__, #fn, err, 0);  \
+#define SISCI_WRAP(fn, ...)                     \
+    ({                                          \
+        sci_error_t err;                        \
+        fn(__VA_ARGS__, &err);                  \
+        SISCI_CHECK(#fn, err, 0);               \
     })
 
 #define SISCI_WRAP_RET(fn, ret, ...)                        \
     ({                                                      \
         sci_error_t err;                                    \
         *(ret) = fn(__VA_ARGS__, &err);                     \
-        handle_sisci_error(__FILE__, __LINE__, #fn, err, 1);  \
+        SISCI_CHECK(#fn, err, 1);                           \
     })
 
 #define SISCI_WRAP_NOERROR(fn, ret, ...)                        \
