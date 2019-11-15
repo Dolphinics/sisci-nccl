@@ -238,13 +238,6 @@ static unsigned int get_segment_id(unsigned int local_offset,
             i);
 }
 
-void print_mailbox(volatile void* addr) {
-    for (int i = 0; i < MAILBOX_SEGMENT_SIZE*MAX_NODES; i++) {
-        printf("%d ", ((uint32_t*)addr)[i]);
-    }
-    printf("\n");
-}
-
 // Create a receiving object and provide a handle to connect to it. The
 // handle can be up to NCCL_NET_HANDLE_MAXSIZE bytes and will be exchanged
 // between ranks to create a connection.
