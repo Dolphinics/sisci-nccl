@@ -50,7 +50,6 @@ struct ncclSisciDev {
 
 struct ncclSisciDev ncclSisciDevs[MAX_SCI_DEVS];
 
-int cuda_device;
 int ncclSisciNDevs = -1;
 
 pthread_mutex_t ncclSisciLock = PTHREAD_MUTEX_INITIALIZER;
@@ -63,12 +62,6 @@ ncclResult_t ncclSisciInit(ncclDebugLogger_t logFunction) {
     if (ncclSisciNDevs == -1) {
         INFO(NCCL_NET|NCCL_INIT, "Trying to load SISCI");
         NCCLCHECK(ncclSCIInitialize(NO_FLAGS));
-
-        cudaError_t err = cudaGetDevice(&cuda_device);
-        if (err != cudaSuccess) {
-            WARN("Failed to get current GPU: %s", cudaGetErrorString(err));
-            return ncclInternalError;
-        }
 
         ncclSisciNDevs = 0;
         for (int i = 0; i < MAX_SCI_DEVS; i++) {
@@ -147,13 +140,14 @@ ncclResult_t ncclSisciPtrSupport(int dev, int* supportedTypes) {
 struct ncclSisciHandle {
     unsigned int node_id;
     unsigned int irno;
-    int cuda_device;
+    int gpu;
 };
 
 struct ncclSisciListenComm {
     struct ncclSisciDev *dev;
     sci_desc_t sd;
     sci_local_data_interrupt_t ir;
+    int gpu;
 };
 
 struct ncclSisciMailbox {
@@ -194,7 +188,8 @@ struct ncclSisciComm {
     unsigned int mem_handle_cnt;
     unsigned int remote_node_offset;
     unsigned int remote_node_id;
-    int remote_cuda_device;
+    int local_gpu;
+    int remote_gpu;
     struct ncclSisciDev *dev;
     struct ncclSisciMailbox *mailbox;
     unsigned int request_cnt;
@@ -238,6 +233,17 @@ static unsigned int get_segment_id(unsigned int local_offset,
             i);
 }
 
+static ncclResult_t cuda_get_device(int *device) {
+    cudaError_t err = cudaGetDevice(device);
+    if (err != cudaSuccess) {
+        WARN("Failed to get current GPU: %s", cudaGetErrorString(err));
+        return ncclInternalError;
+    }
+
+    return ncclSuccess;
+}
+
+
 // Create a receiving object and provide a handle to connect to it. The
 // handle can be up to NCCL_NET_HANDLE_MAXSIZE bytes and will be exchanged
 // between ranks to create a connection.
@@ -249,11 +255,13 @@ ncclResult_t ncclSisciListen(int dev, void* opaqueHandle, void** listenComm) {
     NCCLCHECK(ncclSCIOpen(&comm->sd, NO_FLAGS));
     *listenComm = comm;
 
+    NCCLCHECK(cuda_get_device(&comm->gpu));
+
     struct ncclSisciHandle* handle = (struct ncclSisciHandle*) opaqueHandle;
     static_assert(sizeof(struct ncclSisciHandle) < NCCL_NET_HANDLE_MAXSIZE,
                   "ncclSisciHandle size too large");
     handle->node_id = comm->dev->node_id;
-    handle->cuda_device = cuda_device;
+    handle->gpu = comm->gpu;
 
     NCCLCHECK(ncclSCICreateDataInterrupt(comm->sd, &comm->ir, comm->dev->adapter_no, &handle->irno,
                                NO_CALLBACK, NO_ARG, NO_FLAGS));
@@ -270,13 +278,13 @@ static ncclResult_t ncclSisciCreateMailbox(struct ncclSisciComm *comm,
     NCCLCHECK(ncclCalloc(&mbox, 1));
     mbox->local_id = get_segment_id(comm->dev->node_offset,
                                     comm->remote_node_offset,
-                                    cuda_device,
+                                    comm->local_gpu,
                                     IS_MAILBOX,
                                     comm->type,
                                     0);
     mbox->remote_id = get_segment_id(comm->remote_node_offset,
                                      comm->dev->node_offset,
-                                     comm->remote_cuda_device,
+                                     comm->remote_gpu,
                                      IS_MAILBOX,
                                      (comm->type == SEND_COMM ? RECV_COMM : SEND_COMM),
                                      0);
@@ -418,7 +426,8 @@ ncclResult_t ncclSisciConnect(int dev, void* opaqueHandle, void** sendComm) {
     comm->remote_node_id = handle->node_id;
     comm->remote_node_offset = (comm->remote_node_id >> 2) - 1;
     comm->type = SEND_COMM;
-    comm->remote_cuda_device = handle->cuda_device;
+    NCCLCHECK(cuda_get_device(&comm->local_gpu));
+    comm->remote_gpu = handle->gpu;
 
     INFO(NCCL_NET, "Connecting to node %d on %d", handle->node_id, handle->irno);
 
@@ -426,7 +435,7 @@ ncclResult_t ncclSisciConnect(int dev, void* opaqueHandle, void** sendComm) {
     sci_remote_data_interrupt_t ir;
     uint32_t data[IR_DATA_SIZE];
     data[0] = htons(comm->dev->node_offset);
-    data[1] = htons(cuda_device);
+    data[1] = htons(comm->local_gpu);
 
     NCCLCHECK(ncclSCIOpen(&sd, NO_FLAGS));
     NCCLCHECK(ncclSCIConnectDataInterrupt(sd, &ir, handle->node_id,
@@ -458,11 +467,12 @@ ncclResult_t ncclSisciAccept(void* listenComm, void** recvComm) {
     NCCLCHECK(ncclCalloc(&rcomm, 1));
     rcomm->dev = lcomm->dev;
     rcomm->type = RECV_COMM;
+    rcomm->local_gpu = lcomm->gpu;
 
     NCCLCHECK(ncclSCIWaitForDataInterrupt(lcomm->ir, &data, &size, SCI_INFINITE_TIMEOUT,
                                             NO_FLAGS));
     rcomm->remote_node_offset = ntohs(data[0]);
-    rcomm->remote_cuda_device = ntohs(data[1]);
+    rcomm->remote_gpu = ntohs(data[1]);
     rcomm->remote_node_id = (rcomm->remote_node_offset+1)*4;
 
     NCCLCHECK(ncclSisciCreateMailbox(rcomm, &rcomm->mailbox));
@@ -522,14 +532,14 @@ ncclResult_t ncclSisciRegMr(void* comm, void* data, int size, int type, void** m
     memhandle->id = gcomm->mem_handle_cnt++;
     memhandle->segment_id = get_segment_id(gcomm->dev->node_offset,
                                            gcomm->remote_node_offset,
-                                           cuda_device,
+                                           gcomm->local_gpu,
                                            NOT_MAILBOX,
                                            gcomm->type,
                                            memhandle->id);
 
     memhandle->remote_segment_id = get_segment_id(gcomm->remote_node_offset,
                                                   gcomm->dev->node_offset,
-                                                  gcomm->remote_cuda_device,
+                                                  gcomm->remote_gpu,
                                                   NOT_MAILBOX,
                                                   (gcomm->type == SEND_COMM ? RECV_COMM : SEND_COMM),
                                                   memhandle->id);
